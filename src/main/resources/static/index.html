@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html>
+<body>
+
+<h2>Proximity Group Video Chat</h2>
+
+<div id="joinScreen">
+    <input id="nameInput" placeholder="Enter name">
+    <input id="roomInput" value="demo-room" placeholder="Room">
+    <button onclick="joinGame()">Join</button>
+</div>
+
+<div id="app" style="display:none">
+
+    <canvas id="game" width="800" height="500"
+            style="border:1px solid gray;margin-top:8px"></canvas>
+
+    <div style="margin:6px 0;">
+        <button id="muteBtn">Mute</button>
+        <button id="camBtn">Camera Off</button>
+    </div>
+
+    <div id="videoGrid"
+         style="display:flex;gap:6px;flex-wrap:wrap"></div>
+</div>
+
+<script>
+    /* ===============================
+       GLOBAL
+    ================================*/
+    let name="", room="";
+    const playerId = crypto.randomUUID();
+
+    let localStream = null;
+    let players = {};
+
+    const peers = {};
+    let socket = null;
+
+    let audioEnabled = true;
+    let videoEnabled = true;
+
+    /* ===============================
+       SOCKET
+    ================================*/
+    function createSocket(){
+
+      socket = new WebSocket(
+        (location.protocol === "https:" ? "wss://" : "ws://")
+        + location.host + "/signal"
+      );
+
+      socket.onmessage = e => {
+
+        const m = JSON.parse(e.data);
+
+        if (m.type === "PLAYERS") {
+          players = {};
+          m.players.forEach(p => players[p.id]=p);
+          return;
+        }
+
+        if (m.type === "CLUSTER_JOIN"
+            && m.members.includes(playerId)) {
+          joinCluster(m.members);
+          return;
+        }
+
+        if (m.type === "CLUSTER_LEAVE") {
+          leavePeer(m.playerId);
+          return;
+        }
+
+        if (["offer","answer","candidate"].includes(m.type))
+          handleSignal(m);
+      };
+    }
+    createSocket();
+
+    /* ===============================
+       JOIN
+    ================================*/
+    async function joinGame(){
+
+      name = nameInput.value || "Player";
+      room = roomInput.value || "demo-room";
+
+      joinScreen.style.display="none";
+      app.style.display="block";
+
+      localStream = await navigator.mediaDevices.getUserMedia({
+        video:true, audio:true
+      });
+
+      // self video preview
+      addVideo(playerId, localStream);
+
+      muteBtn.onclick = toggleMute;
+      camBtn.onclick = toggleCamera;
+
+      socket.send(JSON.stringify({
+        type:"join",
+        room,
+        playerId,
+        name
+      }));
+
+      canvas.focus();
+    }
+
+    /* ===============================
+       MUTE / CAMERA
+    ================================*/
+    function toggleMute() {
+      audioEnabled = !audioEnabled;
+      localStream.getAudioTracks().forEach(t => t.enabled = audioEnabled);
+      muteBtn.innerText = audioEnabled ? "Mute" : "Unmute";
+    }
+
+    function toggleCamera() {
+      videoEnabled = !videoEnabled;
+      localStream.getVideoTracks().forEach(t => t.enabled = videoEnabled);
+      camBtn.innerText = videoEnabled ? "Camera Off" : "Camera On";
+    }
+
+    /* ===============================
+       MOVEMENT / MAP  ⭐ FIXED
+    ================================*/
+    const canvas = document.getElementById("game");
+    canvas.setAttribute("tabindex", 0);
+
+    const ctx = canvas.getContext("2d");
+
+    let x = 200, y = 200;
+    const speed = 2.5;
+    const keys = {};
+
+    document.addEventListener("keydown", e => {
+      keys[e.key] = true;
+    });
+
+    document.addEventListener("keyup", e => {
+      keys[e.key] = false;
+    });
+
+    function updatePos() {
+
+      if (!room) return;
+
+      // WASD
+      if (keys["w"] || keys["W"]) y -= speed;
+      if (keys["s"] || keys["S"]) y += speed;
+      if (keys["a"] || keys["A"]) x -= speed;
+      if (keys["d"] || keys["D"]) x += speed;
+
+      // ARROWS
+      if (keys["ArrowUp"])    y -= speed;
+      if (keys["ArrowDown"])  y += speed;
+      if (keys["ArrowLeft"])  x -= speed;
+      if (keys["ArrowRight"]) x += speed;
+
+      x = Math.max(20, Math.min(780, x));
+      y = Math.max(20, Math.min(480, y));
+
+      // ⭐ FIX — update my position locally so canvas redraws
+      if (!players[playerId]) {
+        players[playerId] = { id: playerId, name, x, y };
+      } else {
+        players[playerId].x = x;
+        players[playerId].y = y;
+      }
+
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({
+          type:"move",
+          room,
+          playerId,
+          x,
+          y
+        }));
+      }
+    }
+
+    setInterval(updatePos, 80);
+
+    function draw() {
+
+      ctx.clearRect(0,0,800,500);
+
+      for (const p of Object.values(players)) {
+
+        ctx.fillStyle = (p.id === playerId ? "red" : "blue");
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 12, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillText(p.name, p.x-18, p.y-18);
+      }
+
+      requestAnimationFrame(draw);
+    }
+    draw();
+
+    /* ===============================
+       WEBRTC
+    ================================*/
+    const pcConfig = {
+      iceServers:[
+        { urls:"stun:stun.l.google.com:19302" },
+        {
+          urls:"turn:global.relay.metered.ca:80",
+          username:"openai-demo",
+          credential:"openai-demo"
+        }
+      ]
+    };
+
+    function createPeer(id){
+
+      const pc = new RTCPeerConnection(pcConfig);
+      peers[id] = pc;
+
+      pc._pendingIce=[];
+      pc._makingOffer=false;
+      pc._ignoreOffer=false;
+      pc._polite = (playerId > id);
+
+      localStream.getTracks().forEach(t=>pc.addTrack(t,localStream));
+
+      pc.ontrack = e => addVideo(id, e.streams[0]);
+
+      pc.onicecandidate = e => {
+        if(e.candidate)
+          sendSignal("candidate", id, { candidate:e.candidate });
+      };
+
+      pc.onnegotiationneeded = async () => {
+        try{
+          pc._makingOffer=true;
+          await pc.setLocalDescription(await pc.createOffer());
+          sendSignal("offer", id, { offer:pc.localDescription });
+        } finally {
+          pc._makingOffer=false;
+        }
+      };
+
+      return pc;
+    }
+
+    async function joinCluster(members){
+      for(const id of members){
+        if(id===playerId) continue;
+        if(peers[id]) continue;
+        createPeer(id);
+      }
+    }
+
+    function sendSignal(type,to,payload){
+      socket.send(JSON.stringify({
+        type, room, from:playerId, to, ...payload
+      }));
+    }
+
+    async function handleSignal(m){
+
+      const id = m.from;
+      const pc = peers[id] ?? createPeer(id);
+
+      if(m.type==="offer"){
+
+        const collision =
+          pc._makingOffer || pc.signalingState!=="stable";
+
+        pc._ignoreOffer = !pc._polite && collision;
+        if(pc._ignoreOffer) return;
+
+        await pc.setRemoteDescription(m.offer);
+
+        const ans = await pc.createAnswer();
+        await pc.setLocalDescription(ans);
+
+        sendSignal("answer", id, { answer:pc.localDescription });
+
+        for(const c of pc._pendingIce)
+          await pc.addIceCandidate(c);
+
+        pc._pendingIce = [];
+      }
+
+      else if(m.type==="answer"){
+
+        await pc.setRemoteDescription(m.answer);
+
+        for(const c of pc._pendingIce)
+          await pc.addIceCandidate(c);
+
+        pc._pendingIce = [];
+      }
+
+      else if(m.type==="candidate"){
+
+        if(!pc.remoteDescription)
+          pc._pendingIce.push(m.candidate);
+        else
+          await pc.addIceCandidate(m.candidate);
+      }
+    }
+
+    /* ===============================
+       VIDEO UI
+    ================================*/
+    function addVideo(id, stream){
+
+      let v = document.getElementById("v_"+id);
+
+      if(!v){
+
+        v = document.createElement("video");
+        v.id = "v_"+id;
+        v.autoplay = true;
+        v.playsInline = true;
+        v.muted = (id === playerId);
+        v.width = 200;
+
+        const grid = document.getElementById("videoGrid");
+
+        if(id === playerId) grid.prepend(v);
+        else grid.append(v);
+      }
+
+      v.srcObject = stream;
+      v.play().catch(()=>{});
+    }
+
+    function leavePeer(id){
+
+      const pc = peers[id];
+      if(!pc) return;
+
+      pc.close();
+      delete peers[id];
+
+      const v = document.getElementById("v_"+id);
+      if(v) v.remove();
+    }
+
+</script>
+</body>
+</html>
